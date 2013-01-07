@@ -264,4 +264,8 @@ public interface FSDatasetInterface extends FSDatasetMBean {
    * @throws IOException
    */
   public void validateBlockMetadata(Block b) throws IOException;
+  
+  public String getBlockFilePath(Block b) throws IOException;
+  
+  public void convertToCompressBlockInfo(Block b) throws IOException;
 }

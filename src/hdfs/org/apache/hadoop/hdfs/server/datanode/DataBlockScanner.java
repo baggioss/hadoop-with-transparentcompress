@@ -96,6 +96,9 @@ class DataBlockScanner implements Runnable {
   
   BlockTransferThrottler throttler = null;
   
+  private boolean isFastCheck = false;
+  private boolean onlyCheckCompressData = true;
+  
   private static enum ScanType {
     REMOTE_READ,           // Verified when a block read by a client etc
     VERIFICATION_SCAN,     // scanned as part of periodic verfication
@@ -143,6 +146,8 @@ class DataBlockScanner implements Runnable {
     }
     scanPeriod *= 3600 * 1000;
     // initialized when the scanner thread is started.
+    isFastCheck = conf.getBoolean("block.scanner.isfastcheck", false);
+    onlyCheckCompressData = conf.getBoolean("block.scanner.onlycheckcompress", true);
   }
   
   private synchronized boolean isInitiliazed() {
@@ -305,6 +310,8 @@ class DataBlockScanner implements Runnable {
   private synchronized void updateScanStatus(Block block, 
                                              ScanType type,
                                              boolean scanOk) {
+    if(block == null)
+      return;
     BlockScanInfo info = blockMap.get(block);
     
     if ( info != null ) {
@@ -409,7 +416,7 @@ class DataBlockScanner implements Runnable {
     throttler.setBandwidth(Math.min(bw, MAX_SCAN_RATE));
   }
   
-  private void verifyBlock(Block block) {
+  void verifyBlock(Block block) {
     
     BlockSender blockSender = null;
 
@@ -441,7 +448,7 @@ class DataBlockScanner implements Runnable {
         updateScanStatus(block, ScanType.VERIFICATION_SCAN, true);
 
         return;
-      } catch (IOException e) {
+      } catch (Throwable e) {
 
         totalScanErrors++;
         updateScanStatus(block, ScanType.VERIFICATION_SCAN, false);
@@ -572,6 +579,10 @@ class DataBlockScanner implements Runnable {
       
       init();
       
+      if(isFastCheck){
+        checkData();
+      }
+      
       //Read last verification times
       if (!assignInitialVerificationTimes()) {
         return;
@@ -602,6 +613,51 @@ class DataBlockScanner implements Runnable {
       shutdown();
       LOG.info("Exiting DataBlockScanner thread.");
     }
+  }
+  
+  private synchronized void checkData(){
+    int totalBlockNum = blockInfoSet.size();
+    int goodBlockNum = 0, hasCheckNum = 0;
+    for(BlockScanInfo blkInfo : blockInfoSet){
+      hasCheckNum ++;
+      try{
+        Block block = blkInfo.block; 
+        
+        if(onlyCheckCompressData){
+          String path = dataset.getBlockFilePath(block);
+          if(path != null && !path.isEmpty() && !path.endsWith(FSDataset.CDATA_EXTENSION)){
+            goodBlockNum++;
+            if(goodBlockNum % 200 == 0){
+              LOG.warn("### block checker : has check block : " + hasCheckNum + " , good block num : " + goodBlockNum );
+              LOG.warn(" . progress : " + (hasCheckNum * 100.0/totalBlockNum) + " %. good ratio : " + (goodBlockNum * 100.0/hasCheckNum) + " % .");
+            }
+            continue;
+          }else if(path == null || path.isEmpty()){
+            LOG.warn("path is null or empty . block : " + block.toString());
+            continue;
+          }
+        }
+        BlockSender blockSender = new BlockSender(block, 0, -1, false, 
+          false, true, datanode);
+      
+        DataOutputStream out = new DataOutputStream(new IOUtils.NullOutputStream());
+      
+        blockSender.sendBlock(out, null, null);
+        goodBlockNum ++;
+        if(goodBlockNum % 200 == 0){
+          LOG.warn("### block checker : has check block : " + hasCheckNum + " , good block num : " + goodBlockNum );
+          LOG.warn(" . progress : " + (hasCheckNum * 100.0/totalBlockNum) + " %. good ratio : " + (goodBlockNum * 100.0/hasCheckNum) + " % .");
+        }
+      }catch(Throwable e){
+        if(blkInfo.block != null)
+          LOG.info("## error in check data. " + blkInfo.block.toString(), e);  
+        else
+          LOG.info("## error in check data. ", e);  
+      }
+    }
+    LOG.warn("### block checker report ");
+    LOG.warn("### good block number : " + goodBlockNum);
+    LOG.warn("### total block number : " + totalBlockNum + " , good ratio : " + (goodBlockNum * 100.0/totalBlockNum) + " %.");
   }
   
   synchronized void shutdown() {
@@ -652,7 +708,7 @@ class DataBlockScanner implements Runnable {
             ((info.lastScanType == ScanType.VERIFICATION_SCAN) ? "local" :
               "none");
         buffer.append(String.format("%-26s : status : %-6s type : %-6s" +
-        		                        " scan time : " +
+          	                        " scan time : " +
                                     "%-15d %s\n", info.block, 
                                     (info.lastScanOk ? "ok" : "failed"),
                                     scanType, scanTime,

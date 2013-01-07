@@ -23,6 +23,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.datanode.FSDataset.FSVolume;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.FileUtil.HardLink;
@@ -32,11 +33,12 @@ import org.apache.hadoop.io.IOUtils;
  * This class is used by the datanode to maintain the map from a block 
  * to its metadata.
  */
-class DatanodeBlockInfo {
+public class DatanodeBlockInfo {
 
   private FSVolume volume;       // volume where the block belongs
   private File     file;         // block file
   private boolean detached;      // copy-on-write done for block
+  private long atime;
 
   DatanodeBlockInfo(FSVolume vol, File file) {
     this.volume = vol;
@@ -54,10 +56,13 @@ class DatanodeBlockInfo {
     return volume;
   }
 
-  File getFile() {
+  public File getFile() {
     return file;
   }
 
+  void setFile(File f) {
+    this.file = f;
+  }
   /**
    * Is this block already detached?
    */
@@ -70,6 +75,10 @@ class DatanodeBlockInfo {
    */
   void setDetached() {
     detached = true;
+  }
+  
+  public boolean isCompressed() {
+    return file.getName().endsWith(FSConstants.CDATA_EXTENSION);
   }
 
   /**

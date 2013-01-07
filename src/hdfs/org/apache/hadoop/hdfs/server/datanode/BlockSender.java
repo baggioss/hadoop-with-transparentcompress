@@ -90,6 +90,7 @@ class BlockSender implements java.io.Closeable, FSConstants {
       this.corruptChecksumOk = corruptChecksumOk;
       this.verifyChecksum = verifyChecksum;
       this.blockLength = datanode.data.getLength(block);
+      this.block.setNumBytes(blockLength);
       this.transferToAllowed = datanode.transferToAllowed;
       this.clientTraceFmt = clientTraceFmt;
 

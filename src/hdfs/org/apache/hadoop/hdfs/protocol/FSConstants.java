@@ -83,4 +83,7 @@ public interface FSConstants {
   public static final int LAYOUT_VERSION = -18;
   // Current version: 
   // Support disk space quotas
+  
+  public static final String CDATA_EXTENSION = ".cdata";
+  public static final String TMP_CDATA_EXTENSION = ".cdata.tmp";
 }

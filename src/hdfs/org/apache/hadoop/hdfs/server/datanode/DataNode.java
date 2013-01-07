@@ -18,10 +18,13 @@
 package org.apache.hadoop.hdfs.server.datanode;
 
 import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -40,6 +43,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -66,12 +73,14 @@ import org.apache.hadoop.hdfs.server.namenode.FileChecksumServlets;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.StreamFile;
 import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
+import org.apache.hadoop.hdfs.server.protocol.BlockCompressCommand;
 import org.apache.hadoop.hdfs.server.protocol.BlockMetaDataInfo;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
 import org.apache.hadoop.hdfs.server.protocol.DisallowedDatanodeException;
 import org.apache.hadoop.hdfs.server.protocol.InterDatanodeProtocol;
+import org.apache.hadoop.hdfs.server.protocol.InternalDatanodeProtocol;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.server.protocol.UpgradeCommand;
 import org.apache.hadoop.http.HttpServer;
@@ -89,6 +98,7 @@ import org.apache.hadoop.security.authorize.ServiceAuthorizationManager;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.DiskChecker;
 import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.util.Shell.ShellCommandExecutor;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 import org.apache.hadoop.util.DiskChecker.DiskOutOfSpaceException;
@@ -125,7 +135,7 @@ import org.apache.hadoop.util.DiskChecker.DiskOutOfSpaceException;
  *
  **********************************************************/
 public class DataNode extends Configured 
-    implements InterDatanodeProtocol, ClientDatanodeProtocol, FSConstants, Runnable {
+    implements InterDatanodeProtocol, InternalDatanodeProtocol, ClientDatanodeProtocol, FSConstants, Runnable {
   public static final Log LOG = LogFactory.getLog(DataNode.class);
   
   static{
@@ -190,6 +200,12 @@ public class DataNode extends Configured
   public DataBlockScanner blockScanner = null;
   public Daemon blockScannerThread = null;
   
+  BlockManager blkMgr;
+  Daemon compressorMoniter = null;
+  CompressorMoniter cm = null;
+  String hadoophome;
+  int maxCompressTask, maxXcievers;
+  
   private static final Random R = new Random();
   
   // For InterDataNodeProtocol
@@ -238,6 +254,7 @@ public class DataNode extends Configured
     if (conf.get("slave.host.name") != null) {
       machineName = conf.get("slave.host.name");   
     }
+    blkMgr = new BlockManager(conf);
     if (machineName == null) {
       machineName = DNS.getDefaultHost(
                                      conf.get("dfs.datanode.dns.interface","default"),
@@ -254,6 +271,9 @@ public class DataNode extends Configured
     this.transferToAllowed = conf.getBoolean("dfs.datanode.transferTo.allowed", 
                                              true);
     this.writePacketSize = conf.getInt("dfs.write.packet.size", 64*1024);
+    this.hadoophome = System.getProperty("hadoop.home.dir");
+    this.maxCompressTask = conf.getInt("max.compress.task.num", 100);
+    this.maxXcievers = conf.getInt("dfs.datanode.max.xcievers", DataXceiverServer.MAX_XCEIVER_COUNT);
     String address = 
       NetUtils.getServerAddress(conf,
                                 "dfs.datanode.bindAddress", 
@@ -299,9 +319,12 @@ public class DataNode extends Configured
       // adjust
       this.dnRegistration.setStorageInfo(storage);
       // initialize data node internal structure
-      this.data = new FSDataset(storage, conf);
+      this.data = new FSDataset(storage, blkMgr, conf);
     }
-
+    boolean shouldCompressWork = conf.getBoolean("dfs.should.compressor.run", true);
+    cm = new CompressorMoniter(shouldCompressWork);
+    compressorMoniter = new Daemon(cm);
+    compressorMoniter.setName("compressor-monitor");
       
     // find free port
     ServerSocket ss = (socketWriteTimeout > 0) ? 
@@ -369,6 +392,11 @@ public class DataNode extends Configured
     this.infoServer.addInternalServlet(null, "/streamFile/*", StreamFile.class);
     this.infoServer.addInternalServlet(null, "/getFileChecksum/*",
         FileChecksumServlets.GetServlet.class);
+    this.infoServer.setAttribute("datanode.blockCompresser", blkMgr);
+    this.infoServer.setAttribute("compressormoniter", cm);
+    this.infoServer.addServlet(null, "/compressor", Servlet.class);
+    this.infoServer.setAttribute("datanode.fsdataset", data);
+    this.infoServer.addServlet(null, "/blockCompressReport", FSDataset.Servlet.class);
     this.infoServer.setAttribute("datanode.blockScanner", blockScanner);
     this.infoServer.addServlet(null, "/blockScannerReport", 
                                DataBlockScanner.Servlet.class);
@@ -397,6 +425,7 @@ public class DataNode extends Configured
     dnRegistration.setIpcPort(ipcServer.getListenerAddress().getPort());
 
     LOG.info("dnRegistration = " + dnRegistration);
+    compressorMoniter.start();
   }
 
   /**
@@ -557,6 +586,61 @@ public class DataNode extends Configured
     scheduleBlockReport(initialBlockReportDelay);
   }
 
+  int computeCompressNum(int compressInProgress, int xceiverNum){
+    return (int)((maxCompressTask - compressInProgress) * 1.0 * (maxXcievers - xceiverNum) / maxXcievers);
+  }
+  @Override
+  public BlockCompressCommand getTask(long[] shouldNotCompressBlockList, long[] completeCompressBlockList, int runningCompressingNum) 
+    throws IOException {
+    if(shouldNotCompressBlockList != null){
+      for(long blkid : shouldNotCompressBlockList){
+        Block blk = new Block(blkid);
+        blkMgr.blackList(blk);
+      }
+    }
+    if(completeCompressBlockList != null){
+      for(long blkid : completeCompressBlockList){
+        Block blk = new Block(blkid);
+        blkMgr.setCompressed(blk);
+        try{
+          data.convertToCompressBlockInfo(blk);
+        }catch(IOException e){
+          LOG.info("failed to convert to compress block", e);
+        }
+        LOG.info("In getTask() complete compress block : " + blk.toString());
+      }
+    }
+    int wantCompressNum = computeCompressNum(runningCompressingNum, getXceiverCount()); 
+    if(LOG.isDebugEnabled()){
+      LOG.debug("get task from compressor. In compressor running task num : " + runningCompressingNum + " , want compress number : " + wantCompressNum);
+    }
+    List<String> pathList = new ArrayList<String>();
+    for(int i = 0; i < wantCompressNum; i++){
+      Block blk = blkMgr.poll();
+      if(blk == null){
+        continue;
+      }
+      try{
+        String path = data.getBlockFilePath(blk);
+        if(path != null && !path.isEmpty() && !path.endsWith(FSConstants.CDATA_EXTENSION))
+          pathList.add(path);
+      } catch(IOException e){
+        LOG.info("failed to getBlockFilePath", e);
+      }
+    }
+    return new BlockCompressCommand(pathList);
+  }
+
+  
+  static void stopCompressor(String hadoophome){
+    String res = "";
+    try{
+      res = ShellCommandExecutor.execCommand("bash", "-c", hadoophome + "/bin/stop-compressor.sh");
+      LOG.info(" stop-compressor. res : " + res);
+    }catch(IOException e){
+      LOG.warn("", e);
+    }
+  }
   /**
    * Shut down this instance of the datanode.
    * Returns only after shutdown is complete.
@@ -564,6 +648,13 @@ public class DataNode extends Configured
    * Otherwise, deadlock might occur.
    */
   public void shutdown() {
+    if(compressorMoniter != null){
+      compressorMoniter.interrupt();
+      try{
+        compressorMoniter.join();
+      }catch(Exception e){}
+    }
+    stopCompressor(hadoophome);
     if (infoServer != null) {
       try {
         infoServer.stop();
@@ -1441,7 +1532,9 @@ public class DataNode extends Configured
       return InterDatanodeProtocol.versionID; 
     } else if (protocol.equals(ClientDatanodeProtocol.class.getName())) {
       return ClientDatanodeProtocol.versionID; 
-    }
+    } else if (protocol.equals(InternalDatanodeProtocol.class.getName())){
+      return InternalDatanodeProtocol.versionID;
+    } 
     throw new IOException("Unknown protocol to " + getClass().getSimpleName()
         + ": " + protocol);
   }
@@ -1589,6 +1682,12 @@ public class DataNode extends Configured
     logRecoverBlock("Client", block, targets);
     return recoverBlock(block, keepLength, targets, false);
   }
+  
+
+  void updateBlockAtime(Block blk){
+    if(blkMgr != null)
+      blkMgr.updateBlockAtime(blk);
+  }
 
   private static void logRecoverBlock(String who,
       Block block, DatanodeID[] targets) {
@@ -1599,4 +1698,74 @@ public class DataNode extends Configured
     LOG.info(who + " calls recoverBlock(block=" + block
         + ", targets=[" + msg + "])");
   }
+
+  public static class Servlet extends HttpServlet {
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+        throws IOException {
+      response.setContentType("text/plain");
+      PrintWriter out = response.getWriter();
+      CompressorMoniter moniter = (CompressorMoniter) getServletContext().getAttribute("compressormoniter");
+      boolean shutdownCompressor = (request.getParameter("stop") != null);
+      boolean startCompressor = (request.getParameter("start") != null);
+      
+      String hadoophome = System.getProperty("hadoop.home.dir");
+      try{
+        if(startCompressor){
+          moniter.shouldCompressWork = true;
+          out.write("complete start compressor. ");
+        }else if(shutdownCompressor){
+          moniter.shouldCompressWork = false;
+          stopCompressor(hadoophome);
+          out.write("complete  compressor. ");
+        }else{
+          out.write("please check your command.");
+        }
+      }catch(Exception e){
+        if(out != null)
+          out.write(e.getMessage());
+      }finally{
+        if(out != null)
+          out.close();
+      }
+    }
+  }
+  
+  class CompressorMoniter implements Runnable{
+    boolean shouldCompressWork = true;
+    
+    CompressorMoniter(boolean shouldCompressWork){
+      this.shouldCompressWork = shouldCompressWork;
+    }
+    @Override
+    public void run() {
+        while(shouldRun){
+          try{
+            if(!shouldCompressWork)
+              continue;
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", hadoophome + "/bin/start-compressor.sh");
+            Process p = pb.start();
+            BufferedReader inReader = 
+                new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String resStr = inReader.readLine();
+            if(!resStr.contains("Stop it first")){
+              LOG.info(resStr);
+            }
+            int res = p.waitFor();
+            if(res == 0){
+              Runtime.getRuntime().addShutdownHook(new Thread() {
+                public void run() {
+                  stopCompressor(hadoophome);
+                }
+              });
+            }
+           }catch(Exception e){
+             LOG.warn("", e);
+           }finally{
+             try{
+               Thread.sleep(5000);
+             }catch(InterruptedException ignored){}
+           }
+        }
+      }
+    }
 }

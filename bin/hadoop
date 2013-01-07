@@ -59,6 +59,7 @@ if [ $# = 0 ]; then
   echo "  secondarynamenode    run the DFS secondary namenode"
   echo "  namenode             run the DFS namenode"
   echo "  datanode             run a DFS datanode"
+  echo "  compressor           run a DFS compressor"
   echo "  dfsadmin             run a DFS admin client"
   echo "  mradmin              run a Map-Reduce admin client"
   echo "  fsck                 run a DFS filesystem checking utility"
@@ -191,6 +192,9 @@ elif [ "$COMMAND" = "secondarynamenode" ] ; then
 elif [ "$COMMAND" = "datanode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.datanode.DataNode'
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_DATANODE_OPTS"
+elif [ "$COMMAND" = "compressor" ] ; then
+  CLASS=org.apache.hadoop.hdfs.tools.BlockCompressor
+  HADOOP_OPTS="$HADOOP_OPTS $HADOOP_COMPRESSOR_OPTS"
 elif [ "$COMMAND" = "fs" ] ; then
   CLASS=org.apache.hadoop.fs.FsShell
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_CLIENT_OPTS"

@@ -23,10 +23,14 @@ import java.util.*;
 import javax.management.NotCompliantMBeanException;
 import javax.management.ObjectName;
 import javax.management.StandardMBean;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.hdfs.protocol.CompressUtils;
 import org.apache.hadoop.metrics.util.MBeanUtil;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.DiskChecker;
@@ -35,6 +39,11 @@ import org.apache.hadoop.util.DiskChecker.DiskOutOfSpaceException;
 import org.apache.hadoop.conf.*;
 import org.apache.hadoop.hdfs.server.datanode.metrics.FSDatasetMBean;
 import org.apache.hadoop.hdfs.server.protocol.InterDatanodeProtocol;
+import org.apache.hadoop.hdfs.tools.BlockCompressor;
+import org.apache.hadoop.hdfs.tools.BlockDecompressorStream;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.compress.Decompressor;
+
 
 /**************************************************
  * FSDataset manages a set of data blocks.  Each block
@@ -152,25 +161,28 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
      * Return the generation stamp from the name of the metafile.
      */
     long getGenerationStampFromFile(File[] listdir, File blockFile) {
-      String blockName = blockFile.getName();
-      for (int j = 0; j < listdir.length; j++) {
-        String path = listdir[j].getName();
-        if (!path.startsWith(blockName)) {
-          continue;
+        long id = CompressUtils.filename2id(blockFile.getName());
+        for (int j = 0; j < listdir.length; j++) {
+          String path = listdir[j].getName();
+          if (!path.startsWith("blk_" + id + "_")) {
+            continue;
+          }
+          if (!path.endsWith("meta"))
+            continue;
+          String[] vals = path.split("_");
+          if (vals.length != 3) {     // blk, blkid, genstamp.meta
+            continue;
+          }
+          String[] str = vals[2].split("\\.");
+          if (str.length != 2) {
+            continue;
+          }
+          return Long.parseLong(str[0]);
         }
-        String[] vals = path.split("_");
-        if (vals.length != 3) {     // blk, blkid, genstamp.meta
-          continue;
-        }
-        String[] str = vals[2].split("\\.");
-        if (str.length != 2) {
-          continue;
-        }
-        return Long.parseLong(str[0]);
-      }
-      DataNode.LOG.warn("Block " + blockFile + 
-                        " does not have a metafile!");
-      return Block.GRANDFATHER_GENERATION_STAMP;
+        DataNode.LOG.warn("Block " + blockFile + 
+                          " does not have a metafile!");
+        return Block.GRANDFATHER_GENERATION_STAMP;
+      
     }
 
     /**
@@ -188,10 +200,22 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
       for (int i = 0; i < blockFiles.length; i++) {
         if (Block.isBlockFilename(blockFiles[i])) {
           long genStamp = getGenerationStampFromFile(blockFiles, blockFiles[i]);
-          blockSet.add(new Block(blockFiles[i], blockFiles[i].length(), genStamp));
+          Block blk = new Block(blockFiles[i], blockFiles[i].length(), genStamp);
+          blockSet.add(blk);
+          long mtime = blockFiles[i].lastModified();
+          bm.adjustByBlockReport(blk, mtime);
+        }else if (CompressUtils.isCompressBlockFilename(blockFiles[i])){
+          long genStamp = getGenerationStampFromFile(blockFiles, blockFiles[i]);
+          Block blk = CompressUtils.getCompressBlock(blockFiles[i], genStamp);
+          if(blk != null){
+            blockSet.add(blk);
+          } else {
+            DataNode.LOG.warn("can not gen block for file : " + blockFiles[i].getAbsolutePath());
+          }
         }
       }
     }
+
 
     void getVolumeMap(HashMap<Block, DatanodeBlockInfo> volumeMap, FSVolume volume) {
       if (children != null) {
@@ -204,10 +228,20 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
       for (int i = 0; i < blockFiles.length; i++) {
         if (Block.isBlockFilename(blockFiles[i])) {
           long genStamp = getGenerationStampFromFile(blockFiles, blockFiles[i]);
-          volumeMap.put(new Block(blockFiles[i], blockFiles[i].length(), genStamp), 
-                        new DatanodeBlockInfo(volume, blockFiles[i]));
+          Block blk = new Block(blockFiles[i], blockFiles[i].length(), genStamp);
+          volumeMap.put(blk, new DatanodeBlockInfo(volume, blockFiles[i]));
+          bm.blockMap.put(blk, new BlockInfo(blk, blockFiles[i].lastModified()));
+        } else if (CompressUtils.isCompressBlockFilename(blockFiles[i])){
+          long genStamp = getGenerationStampFromFile(blockFiles, blockFiles[i]);
+          Block blk = CompressUtils.getCompressBlock(blockFiles[i], genStamp);
+          if(blk != null){
+            volumeMap.put(blk, new DatanodeBlockInfo(volume, blockFiles[i]));
+            bm.blockMap.put(blk, new BlockInfo(blk, blockFiles[i].lastModified()));
+          } else {
+            DataNode.LOG.warn("can not gen block for file : " + blockFiles[i].getAbsolutePath());
+          }
         }
-      }
+      } 
     }
         
     /**
@@ -584,16 +618,40 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   }
   
   static File getMetaFile(File f , Block b) {
-    return new File(getMetaFileName(f.getAbsolutePath(),
-                                    b.getGenerationStamp())); 
+    String name = f.getName();
+    if(name.endsWith(CDATA_EXTENSION)){
+      String blkPrefix = CompressUtils.getBlockPrefixByCdataName(name);
+      return new File(getMetaFileName(f.getParent() + "/" + blkPrefix, b.getGenerationStamp())); 
+    }else{
+      return new File(getMetaFileName(f.getAbsolutePath(), b.getGenerationStamp())); 
+    }
   }
+  
   protected File getMetaFile(Block b) throws IOException {
-    return getMetaFile(getBlockFile(b), b);
+    DatanodeBlockInfo info = volumeMap.get(b);
+    if (info != null) {
+      if(info.isCompressed()){
+        File f = info.getFile();
+        return new File(f.getParent(), b.getBlockName() + "_" + b.getGenerationStamp() + METADATA_EXTENSION); 
+      }else{
+        return getMetaFile(getBlockFile(b), b); 
+      }
+    }
+    throw new IOException("can not get block " + b.toString() + " from volumn map.");
   }
 
   /** Find the corresponding meta data file from a given block file */
   private static File findMetaFile(final File blockFile) throws IOException {
-    final String prefix = blockFile.getName() + "_";
+    final String prefix;
+    String filename = blockFile.getName();
+    if(filename.endsWith(CDATA_EXTENSION)){
+      prefix = CompressUtils.getBlockPrefixByCdataName(filename);
+      if(prefix == null){
+        throw new IOException("find error format cdata file. " + blockFile.getAbsolutePath());
+      }
+    }else{
+      prefix = blockFile.getName() + "_";
+    }
     final File parent = blockFile.getParentFile();
     File[] matches = parent.listFiles(new FilenameFilter() {
       public boolean accept(File dir, String name) {
@@ -616,10 +674,12 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   private static long parseGenerationStamp(File blockFile, File metaFile
       ) throws IOException {
     String metaname = metaFile.getName();
-    String gs = metaname.substring(blockFile.getName().length() + 1,
-        metaname.length() - METADATA_EXTENSION.length());
+    String[] str = metaname.split("_");
+    if(str == null || str.length != 3)
+      throw new IOException("Illegal meta file name. " + metaname);
     try {
-      return Long.parseLong(gs);
+      String strGs = str[2].substring(0, str[2].indexOf(METADATA_EXTENSION));
+      return Long.parseLong(strGs);
     } catch(NumberFormatException nfe) {
       throw (IOException)new IOException("blockFile=" + blockFile
           + ", metaFile=" + metaFile).initCause(nfe);
@@ -653,7 +713,12 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
       return null;
     }
     File metafile = findMetaFile(blockfile);
-    return new Block(blkid, blockfile.length(),
+    long len = 0;
+    if(blockfile.getName().endsWith(CDATA_EXTENSION))
+      len = getLengthBefCompress(blockfile.getName());
+    else
+      len = blockfile.length();
+    return new Block(blkid, len,
         parseGenerationStamp(blockfile, metafile));
   }
 
@@ -678,12 +743,18 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   private int maxBlocksPerDir = 0;
   private HashMap<Block,DatanodeBlockInfo> volumeMap = null;
   static  Random random = new Random();
+  private BlockManager bm = null;
+  private Configuration conf;
+  private int type;
   
   /**
    * An FSDataset has a directory where it loads its data files.
    */
-  public FSDataset(DataStorage storage, Configuration conf) throws IOException {
+  public FSDataset(DataStorage storage, BlockManager bm, Configuration conf) throws IOException {
     this.maxBlocksPerDir = conf.getInt("dfs.datanode.numblocks", 64);
+    this.bm = bm;
+    this.conf = conf;
+    type = conf.getInt("block.compressor.codec.type", 0);
     FSVolume[] volArray = new FSVolume[storage.getNumStorageDirs()];
     for (int idx = 0; idx < storage.getNumStorageDirs(); idx++) {
       volArray[idx] = new FSVolume(storage.getStorageDir(idx).getCurrentDir(), conf);
@@ -691,6 +762,11 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     volumes = new FSVolumeSet(volArray);
     volumeMap = new HashMap<Block, DatanodeBlockInfo>();
     volumes.getVolumeMap(volumeMap);
+    if(bm != null){
+      bm.loadOpLog();
+    } else{
+      DataNode.LOG.error("block manager should not be null here.");
+    }
     registerMBean(storage.getStorageID());
   }
 
@@ -719,7 +795,24 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
    * Find the block's on-disk length
    */
   public long getLength(Block b) throws IOException {
-    return getBlockFile(b).length();
+    File f = getBlockFile(b);
+    String fileName = f.getName();
+    if(fileName.endsWith(CDATA_EXTENSION)){
+      long len = getLengthBefCompress(f.getName());
+      if(len < 0)
+        throw new IOException("get len error. block " + b.toString());
+      return len;
+    }else{
+      return f.length();
+    }
+  }
+  
+  public static long getLengthBefCompress(String path){
+      String[] vals = path.split("_");
+      if (vals.length != 4) {
+        return -1;
+      }
+      return Long.parseLong(vals[2]);
   }
 
   /**
@@ -736,20 +829,50 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     return f;
   }
   
+  @Override
+  public synchronized String getBlockFilePath(Block b) throws IOException {
+    File f = getBlockFile(b);
+    return f.getAbsolutePath();
+  }
+
+  // used for unit test
   public synchronized InputStream getBlockInputStream(Block b) throws IOException {
     return new FileInputStream(getBlockFile(b));
   }
 
   public synchronized InputStream getBlockInputStream(Block b, long seekOffset) throws IOException {
-
-    File blockFile = getBlockFile(b);
-    RandomAccessFile blockInFile = new RandomAccessFile(blockFile, "r");
-    if (seekOffset > 0) {
-      blockInFile.seek(seekOffset);
+    DatanodeBlockInfo info = volumeMap.get(b);
+    if(info == null)
+      throw new IOException("can not find DatanodeBlockInfo from volume map when block " + b.toString());
+    File blockFile = info.getFile();
+    if(info.isCompressed()){
+      InputStream cdata = new FileInputStream(blockFile);
+      long blkLenBefCompress = getLengthBefCompress(blockFile.getName());
+      File idx = BlockCompressor.getIdxFile(blockFile.getParentFile(), b.getBlockId());
+      if(!blockFile.exists() || !idx.exists()){
+          throw new IOException("cdata file or index file can not be found.cdata path " +
+            blockFile.getAbsolutePath() + " cdata is exits ? " + (blockFile.exists()) + " index is exist? " + (idx.exists()));
+      }
+      InputStream iis = new FileInputStream(idx);
+      Decompressor decomp = CompressUtils.getDecompressor(blockFile.getName());
+      if(decomp == null){
+        DataNode.LOG.warn("can not get codec of block : " + blockFile.getAbsolutePath());
+        throw new IOException("can not get codec of block : " + blockFile.getAbsolutePath());
+      }
+      BlockDecompressorStream scis = new BlockDecompressorStream(cdata, iis, blkLenBefCompress, decomp);
+      if (seekOffset > 0) {
+        scis.skip(seekOffset);
+      }
+      return scis;
+    }else{
+      RandomAccessFile blockInFile = new RandomAccessFile(blockFile, "r");
+      if (seekOffset > 0) {
+        blockInFile.seek(seekOffset);
+      }
+      return new FileInputStream(blockInFile.getFD());
     }
-    return new FileInputStream(blockInFile.getFD());
   }
-
+  
   /**
    * Returns handles to the block file and its metadata file
    */
@@ -1026,35 +1149,51 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
         // create or reuse temporary file to hold block in the designated volume
         v = volumeMap.get(b).getVolume();
         volumeMap.put(b, new DatanodeBlockInfo(v));
+        if(bm != null){
+            bm.blackListForAppend(b);
+            DataNode.LOG.info("We should not compress block :  " + b + " , throw it into black list for append.");
+          }
       } else {
         // reopening block for appending to it.
         DataNode.LOG.info("Reopen Block for append " + b);
+        if(bm != null){
+          bm.blackList(b);
+          DataNode.LOG.info("We should not compress block :  " + b + " , throw it into black list.");
+        }
         v = volumeMap.get(b).getVolume();
         f = createTmpFile(v, b);
         File blkfile = getBlockFile(b);
         File oldmeta = getMetaFile(b);
         File newmeta = getMetaFile(f, b);
 
+        // rename block file to tmp directory
+        DataNode.LOG.debug("Renaming " + blkfile + " to " + f);
+        if(blkfile.getName().endsWith(CDATA_EXTENSION)){
+            decommpressBlock4Append(b, f);
+            if(!f.exists())
+              throw new IOException("Block " + b + " failed. " +
+                                  " decompress to tmp file " + f);
+            if(!blkfile.delete())
+              throw new IOException("Block " + b + " delete failed. " + blkfile.getAbsolutePath());
+        }else{
+          if (!blkfile.renameTo(f)) {
+            if (!f.delete()) {
+              throw new IOException("Block " + b + " reopen failed. " +
+                                  " Unable to remove file " + f);
+            }
+            if (!blkfile.renameTo(f)) {
+              throw new IOException("Block " + b + " reopen failed. " +
+                                  " Unable to move block file " + blkfile +
+                                  " to tmp dir " + f);
+            }
+          }
+        }
         // rename meta file to tmp directory
         DataNode.LOG.debug("Renaming " + oldmeta + " to " + newmeta);
         if (!oldmeta.renameTo(newmeta)) {
           throw new IOException("Block " + b + " reopen failed. " +
                                 " Unable to move meta file  " + oldmeta +
                                 " to tmp dir " + newmeta);
-        }
-
-        // rename block file to tmp directory
-        DataNode.LOG.debug("Renaming " + blkfile + " to " + f);
-        if (!blkfile.renameTo(f)) {
-          if (!f.delete()) {
-            throw new IOException("Block " + b + " reopen failed. " +
-                                  " Unable to remove file " + f);
-          }
-          if (!blkfile.renameTo(f)) {
-            throw new IOException("Block " + b + " reopen failed. " +
-                                  " Unable to move block file " + blkfile +
-                                  " to tmp dir " + f);
-          }
         }
         volumeMap.put(b, new DatanodeBlockInfo(v));
       }
@@ -1088,6 +1227,12 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     return createBlockWriteStreams( f , metafile);
   }
 
+  private void decommpressBlock4Append(Block b, File tmpFile)throws IOException{
+    InputStream blockIn = this.getBlockInputStream(b, 0);
+    OutputStream tmpStream = new FileOutputStream(tmpFile);
+    IOUtils.copyBytes(blockIn, tmpStream, conf);
+  }
+  
   /**
    * Retrieves the offset in the block to which the
    * the next write will write data to.
@@ -1159,10 +1304,17 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
                             " for block " + b);
     }
         
-    File dest = null;
-    dest = v.addBlock(b, f);
-    volumeMap.put(b, new DatanodeBlockInfo(v, dest));
+    File dest = v.addBlock(b, f);
+    DatanodeBlockInfo info = new DatanodeBlockInfo(v, dest);
+    info.setFile(dest);
+    volumeMap.put(b, info);
     ongoingCreates.remove(b);
+    if(bm != null){
+      if(DataNode.LOG.isDebugEnabled()){
+        DataNode.LOG.debug("add block " + b.toString() + " to block map.");
+      }
+      bm.unprotectedAdd(b);
+    }
   }
 
   /**
@@ -1263,7 +1415,10 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
                             " block file " + f +
                             " does not exist on disk.");
     }
-    if (b.getNumBytes() != f.length()) {
+    String fileName = f.getName();
+    boolean isCompressed = fileName.endsWith(CDATA_EXTENSION);
+    if ((!isCompressed && b.getNumBytes() != f.length())
+        || (isCompressed && b.getNumBytes() != getLengthBefCompress(f.getName()))) {
       throw new IOException("Block " + b + 
                             " length is " + b.getNumBytes()  +
                             " does not match block file length " +
@@ -1301,9 +1456,10 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     for (int i = 0; i < invalidBlks.length; i++) {
       File f = null;
       FSVolume v;
+      DatanodeBlockInfo dinfo = null;
       synchronized (this) {
         f = getFile(invalidBlks[i]);
-        DatanodeBlockInfo dinfo = volumeMap.get(invalidBlks[i]);
+        dinfo = volumeMap.get(invalidBlks[i]);
         if (dinfo == null) {
           DataNode.LOG.warn("Unexpected error trying to delete block "
                            + invalidBlks[i] + 
@@ -1337,17 +1493,23 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
           continue;
         }
         v.clearPath(parent);
-        volumeMap.remove(invalidBlks[i]);
       }
-      File metaFile = getMetaFile( f, invalidBlks[i] );
-      long blockSize = f.length()+metaFile.length();
-      if ( !f.delete() || ( !metaFile.delete() && metaFile.exists() ) ) {
+      File metaFile = getMetaFile( invalidBlks[i] );
+      File idx = BlockCompressor.getIdxFile(f.getParentFile(), invalidBlks[i].getBlockId());
+      
+      long dfsBytes = 0;
+      if(idx != null && idx.exists() && dinfo != null && dinfo.isCompressed()){
+        dfsBytes = f.length() + metaFile.length() + idx.length();
+      }else{
+        dfsBytes = f.length() + metaFile.length();  
+      }
+      if ( !f.delete() || ( !metaFile.delete() && metaFile.exists() ) || (!idx.delete() && idx.exists()) ) {
         DataNode.LOG.warn("Unexpected error trying to delete block "
                           + invalidBlks[i] + " at file " + f);
         error = true;
         continue;
       }
-      v.decDfsUsed(blockSize);
+      v.decDfsUsed(dfsBytes);
       DataNode.LOG.info("Deleting block " + invalidBlks[i] + " file " + f);
       if (f.exists()) {
         //
@@ -1355,6 +1517,13 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
         // This will go away in the future.
         //
         DataNode.LOG.info("File " + f + " was deleted but still exists!");
+      }else{
+        if(bm != null){
+          bm.remove(invalidBlks[i]);
+          if(DataNode.LOG.isDebugEnabled()){
+            DataNode.LOG.debug("delete block " + invalidBlks[i] + " from block map.");
+          }
+        }
       }
     }
     if (error) {
@@ -1373,6 +1542,33 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     return null;
   }
 
+  public synchronized void convertToCompressBlockInfo(Block b) throws IOException{
+    DatanodeBlockInfo info = volumeMap.get(b);
+    if(info == null){
+      throw new IOException("can not find block " + b.toString() + " in volumeMap");
+    }
+    File preCompressFilePath = info.getFile();
+    String parentDir = preCompressFilePath.getParent();
+    b.setNumBytes(preCompressFilePath.length());
+    String compressPath = CompressUtils.getCompressBlockFilePath(b.getBlockName(), type, b); 
+    info.setFile(new File(parentDir, compressPath));
+    DataNode.LOG.info("convert to compress block info " + b.toString());
+    if(isCompressComplete(b, preCompressFilePath.getParentFile())){
+      DataNode.LOG.info("complete compress , remove raw data. " + preCompressFilePath.getAbsolutePath());
+      preCompressFilePath.delete();
+    }
+  }
+  
+  private boolean isCompressComplete(Block b, File pdir){
+    File compressFile = new File(pdir, CompressUtils.getCompressBlockFilePath(b.getBlockName(), type, b));
+    File idxFile = BlockCompressor.getIdxFile(pdir, b.getBlockId());
+    if(compressFile != null && idxFile != null){
+      DataNode.LOG.debug("check file exits ? compressFile : " + compressFile.getAbsolutePath() 
+           + " , idx file : " + idxFile.getAbsolutePath());
+      return compressFile.exists() &&  idxFile.exists();
+    }
+    return false;
+  }
   /**
    * check if a data directory is healthy
    * @throws DiskErrorException
@@ -1429,5 +1625,63 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
 
   public String getStorageInfo() {
     return toString();
+  }
+  
+  void printProgressReport(StringBuilder sb){
+    int compressBlock = 0, uncompressBlock = 0;
+    long afterCompressLen = 0, compafterCompressLen = 0; 
+    long befCompressLen = 0, compbefCompressLen = 0;
+    long blackListNum = 0;
+    
+    synchronized(this){
+      for(Block blk : volumeMap.keySet()){
+        DatanodeBlockInfo dbinfo = volumeMap.get(blk);
+        if(dbinfo == null || dbinfo.getFile() == null)
+          continue;
+        File f = dbinfo.getFile();
+        long len = f.length();
+        long num = getLengthBefCompress(f.getName());
+        if(f.getName().endsWith(CDATA_EXTENSION)){
+          compressBlock ++;
+          compafterCompressLen += len;
+          compbefCompressLen += num;
+        }else{
+          uncompressBlock ++;
+          afterCompressLen += len;
+          befCompressLen += len;
+        }
+      }
+      blackListNum = bm.handler.blackList.size();
+    }
+    
+    sb.append(String.format("compress block : %-8d , before size , %-10d , after compress size : %-10d , compress ratio %5.2f \n", 
+                             compressBlock, compbefCompressLen, compafterCompressLen, (compbefCompressLen*1.0/compafterCompressLen)));
+    sb.append(String.format("total block    : %-8d , before size , %-10d , after compress size : %-10d , compress ratio %5.2f \n", 
+                             (compressBlock + uncompressBlock), (compbefCompressLen + befCompressLen), 
+                             (compafterCompressLen + afterCompressLen), ((compbefCompressLen + befCompressLen)*1.0/(compafterCompressLen + afterCompressLen))));
+    sb.append(String.format("compress block/total block : %5.2f %% \n", compressBlock*1.0 /(compressBlock + uncompressBlock) *100));
+    sb.append(String.format("save space : %5.2f T \n", (compbefCompressLen - compafterCompressLen)*1.0/1024/1024/1024/1024));
+    sb.append(String.format("black list num : %-8d \n", blackListNum));
+  }
+  
+  public static class Servlet extends HttpServlet {
+    public void doGet(HttpServletRequest request, 
+                      HttpServletResponse response) throws IOException {
+      
+      response.setContentType("text/plain");
+      
+      BlockManager bm = (BlockManager) getServletContext().getAttribute("datanode.blockCompresser");
+      FSDataset data = (FSDataset) getServletContext().getAttribute("datanode.fsdataset");
+      boolean isProgress = (request.getParameter("progress") != null);
+      String limitStr = request.getParameter("limit");
+      int limit = (limitStr == null || limitStr.isEmpty()) ? 100 : Integer.valueOf(limitStr);
+      StringBuilder buffer = new StringBuilder();
+      if(isProgress){
+        data.printProgressReport(buffer);
+      } else{
+        bm.printQueueReport(buffer, limit);
+      }
+      response.getWriter().write(buffer.toString()); // extra copy!
+    }
   }
 }

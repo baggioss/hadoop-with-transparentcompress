@@ -58,6 +58,7 @@
   <property name="c++.pipes.src" value="${c++.src}/pipes"/>
   <property name="c++.examples.pipes.src" value="${examples.dir}/pipes"/>
   <property name="c++.libhdfs.src" value="${c++.src}/libhdfs"/>
+  <property name="idlerunner.src" value="${c++.src}/idlerunner"/>
   <property name="librecordio.src" value="${c++.src}/librecordio"/>
   <property name="tools.src" value="${basedir}/src/tools"/>
 
@@ -84,8 +85,10 @@
   <property name="build.c++.utils" value="${build.c++}/utils"/>
   <property name="build.c++.pipes" value="${build.c++}/pipes"/>
   <property name="build.c++.libhdfs" value="${build.c++}/libhdfs"/>
+  <property name="build.idlerunner" value="${build.dir}/idlerunner"/>
   <property name="build.c++.examples.pipes" 
             value="${build.c++}/examples/pipes"/>
+  <property name="idlerunner.name" value="idlerunner"/> 
   <property name="build.docs" value="${build.dir}/docs"/>
   <property name="build.docs.cn" value="${build.dir}/docs/cn"/>
   <property name="build.javadoc" value="${build.docs}/api"/>
@@ -535,8 +538,20 @@
 
   <target name="compile-core"
           depends="clover,compile-core-classes,compile-mapred-classes,
-  	compile-hdfs-classes,compile-core-native,compile-c++" 
+  	compile-hdfs-classes,compile-core-native,compile-c++,compile-idlerunner" 
   	description="Compile core only">
+  </target>
+	
+  <target name="compile-idlerunner" depends="init">
+    <delete dir="${build.idlerunner}"/>
+    <delete file="${basedir}/bin/${idlerunner.name}"/>
+    <delete file="${idlerunner.src}/${idlerunner.name}"/>
+    <mkdir dir="${build.idlerunner}"/>
+    <exec dir="${idlerunner.src}" executable="${make.cmd}" failonerror="true"/>
+    <copy file="${idlerunner.src}/${idlerunner.name}" todir="${basedir}/bin"/>
+    <chmod perm="ugo+x" type="file">
+        <fileset file="${basedir}/bin/${idlerunner.name}"/>
+    </chmod>
   </target>
 
   <target name="compile-contrib" depends="compile-core,compile-c++-libhdfs">

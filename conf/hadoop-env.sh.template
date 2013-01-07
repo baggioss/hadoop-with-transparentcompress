@@ -21,6 +21,7 @@
 export HADOOP_NAMENODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_NAMENODE_OPTS"
 export HADOOP_SECONDARYNAMENODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_SECONDARYNAMENODE_OPTS"
 export HADOOP_DATANODE_OPTS="-Dcom.sun.management.jmxremote $HADOOP_DATANODE_OPTS"
+export HADOOP_COMPRESSOR_OPTS="-Dcom.sun.management.jmxremote $HADOOP_DATANODE_OPTS"
 export HADOOP_BALANCER_OPTS="-Dcom.sun.management.jmxremote $HADOOP_BALANCER_OPTS"
 export HADOOP_JOBTRACKER_OPTS="-Dcom.sun.management.jmxremote $HADOOP_JOBTRACKER_OPTS"
 # export HADOOP_TASKTRACKER_OPTS=
@@ -47,6 +48,8 @@ export HADOOP_JOBTRACKER_OPTS="-Dcom.sun.management.jmxremote $HADOOP_JOBTRACKER
 # The directory where pid files are stored. /tmp by default.
 # export HADOOP_PID_DIR=/var/hadoop/pids
 
+# 
+export HADOOP_COMPRESSOR_OPTS="-Xmx512m"
 # A string representing this instance of hadoop. $USER by default.
 # export HADOOP_IDENT_STRING=$USER
 

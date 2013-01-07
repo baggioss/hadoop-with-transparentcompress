@@ -53,10 +53,6 @@ public class Block implements Writable, Comparable<Block> {
     }
   }
 
-  static long filename2id(String name) {
-    return Long.parseLong(name.substring("blk_".length()));
-  }
-
   private long blockId;
   private long numBytes;
   private long generationStamp;
@@ -75,7 +71,7 @@ public class Block implements Writable, Comparable<Block> {
    * Find the blockid from the given filename
    */
   public Block(File f, long len, long genstamp) {
-    this(filename2id(f.getName()), len, genstamp);
+    this(CompressUtils.filename2id(f.getName()), len, genstamp);
   }
 
   public void set(long blkid, long len, long genStamp) {
